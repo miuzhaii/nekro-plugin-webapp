@@ -1,85 +1,20 @@
-"""WebApp 插件服务层"""
+"""服务模块
 
-from .agent_pool import (
-    add_message_to_agent,
-    archive_agent,
-    auto_archive_expired_agents,
-    cancel_agent,
-    clean_completed_agents,
-    confirm_agent,
-    create_agent,
-    delete_agent_template_var,
-    fail_agent,
-    force_archive_oldest_confirmed,
-    fork_agent,
-    get_active_agents_for_chat,
-    get_agent,
-    get_agent_by_id,
-    get_agent_template_vars,
-    get_all_chat_keys_with_agents,
-    get_archived_agents_count,
-    get_chat_registry,
-    get_resumable_agents,
-    load_chat_registry,
-    register_active_chat_key,
-    reset_failed_agent,
-    save_chat_registry,
-    set_agent_template_var,
-    unregister_chat_key_if_empty,
-    update_agent,
-    update_agent_deployed_url,
-    update_agent_html,
-    update_agent_progress,
-    update_agent_status,
-)
-from .agent_runner import (
-    get_running_task_keys,
-    start_agent_task,
-    stop_agent_task,
-    stop_all_tasks,
-    wake_up_agent,
-)
-from .deploy import check_worker_health, deploy_html_to_worker
-from .message_bus import notify_main_agent, send_to_webdev_agent
+包含 WebDev 插件的核心服务。
+"""
+
+from .compiler_client import check_project, compile_project
+from .deploy import deploy_html_to_worker
+from .task_tracer import TaskEvent, TaskTracer
+from .vfs import ProjectContext, clear_project_context, get_project_context
 
 __all__ = [
-    "add_message_to_agent",
-    "archive_agent",
-    "auto_archive_expired_agents",
-    "cancel_agent",
-    "check_worker_health",
-    "clean_completed_agents",
-    "confirm_agent",
-    "create_agent",
-    "delete_agent_template_var",
+    "ProjectContext",
+    "TaskEvent",
+    "TaskTracer",
+    "check_project",
+    "clear_project_context",
+    "compile_project",
     "deploy_html_to_worker",
-    "fail_agent",
-    "force_archive_oldest_confirmed",
-    "fork_agent",
-    "get_active_agents_for_chat",
-    "get_agent",
-    "get_agent_by_id",
-    "get_agent_template_vars",
-    "get_all_chat_keys_with_agents",
-    "get_archived_agents_count",
-    "get_chat_registry",
-    "get_resumable_agents",
-    "get_running_task_keys",
-    "load_chat_registry",
-    "notify_main_agent",
-    "register_active_chat_key",
-    "reset_failed_agent",
-    "save_chat_registry",
-    "send_to_webdev_agent",
-    "set_agent_template_var",
-    "start_agent_task",
-    "stop_agent_task",
-    "stop_all_tasks",
-    "unregister_chat_key_if_empty",
-    "update_agent",
-    "update_agent_deployed_url",
-    "update_agent_html",
-    "update_agent_progress",
-    "update_agent_status",
-    "wake_up_agent",
+    "get_project_context",
 ]

@@ -1,543 +1,577 @@
-"""
-# WebApp 快速部署插件
+"""WebApp 快速部署插件
 
-将 HTML 内容快速部署到 Cloudflare Workers 并生成在线访问链接。
-支持多 Agent 异步协作模式进行网页开发。
-
-## 主要功能
-
-- **多 Agent 协作**：创建独立的网页开发 Agent 异步工作
-- **智能难度评估**：AI 自动评估任务难度，复杂任务使用高级模型
-- **实时状态感知**：主 Agent 可实时查看子 Agent 的工作进度
-- **双向通信**：主 Agent 和子 Agent 可以相互发送消息和反馈
-- **AI 一键部署**：通过简单的 API 调用将 HTML 部署为在线网页
-- **Web 管理界面**：可视化管理已部署的页面
+AI 驱动的 Web 应用开发工具，使用单 Agent + Tool Call 架构。
+支持异步任务模式，在后台执行并报告进度。
 """
 
-from typing import Optional
+import time
+from typing import AsyncGenerator, List, Optional
 
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
 from nekro_agent.services.plugin.base import SandboxMethodType
+from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl, TaskSignal, task
 
-from . import commands as _commands  # noqa: F401 - 注册管理命令
-from .handlers import create_router  # noqa: F401
-from .models import AgentStatus, MessageType
+from . import commands as _commands  # noqa: F401
 from .plugin import config, plugin
-from .prompts import inject_webapp_status
-from .services import (
-    archive_agent,
-    cancel_agent,
-    confirm_agent,
-    create_agent,
-    delete_agent_template_var,
-    fork_agent,
-    get_active_agents_for_chat,
-    get_agent,
-    get_all_chat_keys_with_agents,
-    get_chat_registry,
-    get_resumable_agents,
-    register_active_chat_key,
-    reset_failed_agent,
-    send_to_webdev_agent,
-    set_agent_template_var,
-    start_agent_task,
-    stop_all_tasks,
-    update_agent,
-    wake_up_agent,
-)
+from .services.task_tracer import TaskTracer
+from .services.vfs import clear_project_context, get_project_context
 
 __all__ = ["plugin"]
 
 
-# ==================== 主 Agent 调用的方法 ====================
+# ==================== 异步任务 ====================
 
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "创建网页开发Agent")
-async def create_webapp_agent(
+@plugin.mount_async_task("webapp_dev")
+async def _webapp_dev_task(
+    handle: AsyncTaskHandle,
+    requirement: str,
+    webapp_task_id: str,
+    existing_files: Optional[List[str]] = None,
+) -> AsyncGenerator[TaskCtl, None]:
+    """WebApp 开发异步任务
+
+    通过 yield TaskCtl 报告状态，支持进度追踪和中断。
+    """
+    from .core.agent_loop import run_developer_loop
+    from .runtime import set_adapter
+    from .runtime.nekro import NekroAdapter
+    from .services.compiler_client import compile_project
+    from .services.deploy import deploy_html_to_worker
+    from .services.runtime_state import runtime_state
+    from .services.task_manager import task_manager  # Import added for status update
+
+    chat_key = handle.chat_key
+    # 使用传递进来的 ID，确保与 task_manager 一致
+    task_id = webapp_task_id
+
+    # 初始化运行时适配器 (关键：必须在 run_developer_loop 之前设置)
+    adapter = NekroAdapter(
+        plugin_data_dir=str(plugin.get_plugin_data_dir()),
+        model_group=config.MODEL_GROUP,
+    )
+    adapter.set_notify_callback(handle.notify_agent)
+    set_adapter(adapter)
+
+    # 创建任务追踪器
+    tracer = TaskTracer(
+        chat_key=chat_key,
+        root_agent_id=task_id,
+        task_description=requirement.strip()[:200],
+        plugin_data_dir=str(plugin.get_plugin_data_dir()),
+    )
+
+    tracer.log_event(
+        event_type=tracer.EVENT.TASK_START,
+        agent_id=task_id,
+        message=f"开始任务: {requirement.strip()[:100]}...",
+    )
+
+    yield TaskCtl.report_progress("🚀 开始开发...", 0)
+
+    # 检查取消
+    if handle.is_cancelled:
+        tracer.finalize("CANCELLED")
+        yield TaskCtl.cancel("任务已取消")
+        return
+
+    # 运行 Developer 循环
+    try:
+        yield TaskCtl.report_progress("🔧 AI 正在编写代码...", 20)
+
+        success, result = await run_developer_loop(
+            chat_key=chat_key,
+            task_description=requirement.strip(),
+            tracer=tracer,
+            model_group=config.MODEL_GROUP,
+            max_iterations=config.MAX_ITERATIONS,
+            existing_files=existing_files,
+        )
+
+        # 保存 VFS 快照
+        project = get_project_context(chat_key, task_id)
+        tracer.save_vfs_snapshot(project)
+
+        if not success:
+            await handle.notify_agent(f"❌ WebApp 开发失败: {result}")
+            tracer.log_event(
+                event_type=tracer.EVENT.NOTIFICATION_SENT,
+                agent_id=task_id,
+                message="已通知主 Agent: 开发失败",
+            )
+            tracer.finalize("FAILED", result)
+            yield TaskCtl.fail(f"开发失败: {result}")
+            return
+
+        yield TaskCtl.report_progress("📦 编译中...", 70)
+
+        # 最终编译（生成部署产物）
+        files = project.get_snapshot()
+        tracer.log_event(
+            event_type=tracer.EVENT.FINAL_COMPILE_START,
+            agent_id=task_id,
+            message="最终编译开始",
+            file_count=len(files),
+        )
+
+        compile_success, js_output, externals = await compile_project(
+            files=files,
+            env_vars=None,
+            tracer=tracer,
+            agent_id=task_id,
+        )
+
+        if not compile_success:
+            tracer.log_event(
+                event_type=tracer.EVENT.FINAL_COMPILE_FAILED,
+                agent_id=task_id,
+                message=f"最终编译失败: {js_output[:200]}",
+                level="ERROR",
+            )
+            await handle.notify_agent(f"❌ WebApp 编译失败 (ID: {task_id})")
+            tracer.log_event(
+                event_type=tracer.EVENT.NOTIFICATION_SENT,
+                agent_id=task_id,
+                message="已通知主 Agent: 编译失败",
+            )
+            tracer.finalize("COMPILE_FAILED", js_output)
+            yield TaskCtl.fail(f"编译失败: {js_output[:200]}")
+            return
+
+        tracer.log_event(
+            event_type=tracer.EVENT.FINAL_COMPILE_SUCCESS,
+            agent_id=task_id,
+            message="最终编译成功",
+            output_size=len(js_output),
+            externals=externals,
+        )
+
+        # ==================== 外部依赖验证与动态解析 ====================
+        from .services.html_generator import generate_shell_html, validate_externals
+
+        extra_imports: dict[str, str] = {}
+
+        if externals:
+            tracer.log_event(
+                event_type=tracer.EVENT.DEPENDENCY_CHECK,
+                agent_id=task_id,
+                message=f"检查外部依赖: {', '.join(externals)}",
+                externals=externals,
+            )
+
+            is_valid, missing = validate_externals(externals)
+
+            if not is_valid:
+                # 尝试动态解析缺失的依赖
+                tracer.log_event(
+                    event_type=tracer.EVENT.DEPENDENCY_RESOLVE_START,
+                    agent_id=task_id,
+                    message=f"尝试动态解析未知依赖: {', '.join(missing)}",
+                    missing_packages=missing,
+                )
+
+                from .services.dependency_resolver import resolve_missing_dependencies
+
+                resolved, unresolved = await resolve_missing_dependencies(
+                    missing,
+                    model_group=config.MODEL_GROUP,
+                )
+
+                if resolved:
+                    extra_imports.update(resolved)
+                    tracer.log_event(
+                        event_type=tracer.EVENT.DEPENDENCY_RESOLVE_SUCCESS,
+                        agent_id=task_id,
+                        message=f"成功解析 {len(resolved)} 个依赖",
+                        resolved=list(resolved.keys()),
+                    )
+
+                if unresolved:
+                    # 仍有无法解析的依赖，拒绝部署
+                    error_msg = (
+                        f"以下外部依赖未在系统中配置且无法自动解析: {', '.join(unresolved)}\n"
+                        "请使用系统支持的库，或联系管理员添加。\n"
+                        "支持的库请参考开发文档。"
+                    )
+                    tracer.log_event(
+                        event_type=tracer.EVENT.DEPENDENCY_RESOLVE_FAILED,
+                        agent_id=task_id,
+                        message=f"依赖解析失败: {', '.join(unresolved)}",
+                        unresolved=unresolved,
+                        level="ERROR",
+                    )
+                    await handle.notify_agent(f"❌ WebApp 依赖解析失败 (ID: {task_id})\n{error_msg}")
+                    tracer.log_event(
+                        event_type=tracer.EVENT.NOTIFICATION_SENT,
+                        agent_id=task_id,
+                        message="已通知主 Agent: 依赖解析失败",
+                    )
+                    tracer.finalize("DEPENDENCY_ERROR", error_msg)
+                    yield TaskCtl.fail(f"依赖解析失败: {error_msg}")
+                    return
+
+        yield TaskCtl.report_progress("🚀 部署中...", 90)
+
+        # 尝试获取 Agent 设定的标题
+        state = runtime_state.get_state(chat_key, task_id)
+        page_title = state.title if state and state.title else "WebApp"
+
+        html_content = generate_shell_html(
+            title=page_title,
+            body_js=js_output,
+            dependencies=[],
+            extra_imports=extra_imports,
+        )
+
+        tracer.log_event(
+            event_type=tracer.EVENT.DEPLOY_START,
+            agent_id=task_id,
+            message="开始部署到 Worker",
+        )
+
+        # 部署
+        url = await deploy_html_to_worker(
+            html_content=html_content,
+            title="WebApp",
+            description=requirement.strip()[:100],
+        )
+
+        if url:
+            tracer.log_event(
+                event_type=tracer.EVENT.DEPLOY_SUCCESS,
+                agent_id=task_id,
+                message="部署成功",
+                url=url,
+            )
+            desc_short = (
+                requirement.strip()[:20] + "..."
+                if len(requirement.strip()) > 20
+                else requirement.strip()
+            )
+            await handle.notify_agent(
+                f"✅ WebApp 部署成功! (ID: {task_id})\n📝 {desc_short}\n🔗 {url}",
+            )
+            tracer.log_event(
+                event_type=tracer.EVENT.NOTIFICATION_SENT,
+                agent_id=task_id,
+                message="已通知主 Agent: 部署成功",
+            )
+            tracer.finalize("SUCCESS")
+            yield TaskCtl.success("部署成功", data={"url": url})
+        else:
+            tracer.log_event(
+                event_type=tracer.EVENT.DEPLOY_FAILED,
+                agent_id=task_id,
+                message="部署失败，URL 为空",
+                level="ERROR",
+            )
+            await handle.notify_agent(
+                f"❌ WebApp 部署失败 (ID: {task_id})\n请检查 Worker 配置",
+            )
+            tracer.log_event(
+                event_type=tracer.EVENT.NOTIFICATION_SENT,
+                agent_id=task_id,
+                message="已通知主 Agent: 部署失败",
+            )
+            tracer.finalize("DEPLOY_FAILED")
+            yield TaskCtl.fail("部署失败")
+
+    except Exception as e:
+        logger.exception(f"WebApp 任务异常: {e}")
+        await handle.notify_agent(f"❌ WebApp 任务异常 (ID: {task_id}): {e}")
+        tracer.log_event(
+            event_type=tracer.EVENT.NOTIFICATION_SENT,
+            agent_id=task_id,
+            message=f"已通知主 Agent: 任务异常 - {e}",
+        )
+        tracer.finalize("ERROR", str(e))
+        yield TaskCtl.fail(f"任务异常: {e}")
+
+
+# ==================== 沙盒方法 ====================
+
+
+@plugin.mount_sandbox_method(SandboxMethodType.TOOL, "创建WebApp任务")
+async def create_webapp_task(
     _ctx: AgentCtx,
     requirement: str,
-    difficulty: int,
-    template_vars: Optional[dict[str, str]] = None,
 ) -> str:
-    """创建一个新的网页开发 Agent 来处理网页开发任务
+    """创建 WebApp 开发任务
 
-    当用户需要创建网页时，调用此方法创建一个独立的子 Agent 来异步完成开发工作。
-    子 Agent 会自动开始工作，你可以通过提示词注入查看其进度。
+    启动后台 AI 开发任务。任务完成后会自动通知。
 
     Args:
-        requirement: 详细的网页需求描述，包括功能要求、设计风格、内容等
-        difficulty: 任务难度评分 (1-10)，由你根据需求复杂度判断
-            - 1-3: 简单任务（静态展示页、简单介绍页）
-            - 4-6: 中等任务（响应式布局、基础交互）
-            - 7-10: 困难任务（复杂动画、数据可视化、游戏等）
-        template_vars: 模板变量字典，如 {"logo": "base64...", "name": "张三"}
-            子 Agent 可在 HTML 中使用 {{key}} 占位符引用这些变量，部署时自动替换
+        requirement: 完整的网页需求描述（必须自包含所有必要信息）
 
     Returns:
-        创建结果，包含新 Agent 的 ID
-
-    Examples:
-        # 创建一个简历页面
-        result = create_webapp_agent("帮我创建一个个人简历页面，要求现代简约风格，深色主题", 4)
-
-        # 创建带模板变量的页面
-        result = create_webapp_agent(
-            "创建个人主页，使用提供的 logo 和名字",
-            5,
-            {"logo_base64": "data:image/png;base64,...", "name": "张三"}
-        )
+        str: 创建成功返回任务 ID，失败抛出异常
     """
+    from .services.task_manager import task_manager
+
     if not requirement or not requirement.strip():
         raise ValueError("需求描述不能为空")
+    if not config.WORKER_URL or not config.ACCESS_KEY:
+        raise ValueError("未配置 Worker 地址或访问密钥")
 
-    if not config.WORKER_URL:
-        raise ValueError("未配置 Worker 地址，请先在插件配置中设置 WORKER_URL")
-    if not config.ACCESS_KEY:
-        raise ValueError("未配置访问密钥，请先配置 ACCESS_KEY")
+    # 检查并行任务数
+    active_count = len(
+        [
+            t
+            for t in task_manager.list_active_tasks(_ctx.chat_key)
+            if t.status in ("pending", "running")
+        ],
+    )
+    if active_count >= config.MAX_CONCURRENT_TASKS:
+        raise ValueError(f"已达最大并行任务数 ({config.MAX_CONCURRENT_TASKS})")
 
-    # 验证难度范围
-    difficulty = max(1, min(10, difficulty))
+    # 创建任务记录
+    webapp_task = task_manager.create_task(_ctx.chat_key, requirement)
+    task_id = webapp_task.task_id
 
-    # 创建 Agent
-    agent, error = await create_agent(_ctx.chat_key, requirement.strip(), difficulty)
-    if error:
-        raise RuntimeError(f"创建失败: {error}")
-    if not agent:
-        raise RuntimeError("创建失败: 未知错误")
+    # 终态回调：统一处理任务状态同步
+    def _on_terminal(ctl: TaskCtl) -> None:
+        if ctl.signal == TaskSignal.SUCCESS:
+            url = ctl.data.get("url") if isinstance(ctl.data, dict) else None
+            task_manager.update_status(_ctx.chat_key, task_id, "success", url=url)
+        else:
+            task_manager.update_status(_ctx.chat_key, task_id, "failed", error=ctl.message)
 
-    # 设置模板变量
-    if template_vars:
-        for key, value in template_vars.items():
-            agent.set_template_var(str(key), str(value))
-        await update_agent(agent)
-
-    # 启动 Agent 工作
-    await start_agent_task(agent.agent_id, _ctx.chat_key)
-
-    # 模型信息
-    model_info = ""
-    if difficulty >= config.DIFFICULTY_THRESHOLD and config.ADVANCED_MODEL_GROUP:
-        model_info = " (使用高级模型)"
-
-    difficulty_desc = {
-        range(1, 4): "🟢 简单",
-        range(4, 7): "🟡 中等",
-        range(7, 11): "🔴 困难",
-    }
-    diff_str = next((v for k, v in difficulty_desc.items() if difficulty in k), "")
-
-    # 模板变量信息
-    vars_info = ""
-    if template_vars:
-        vars_info = f"\n📦 模板变量: {len(template_vars)} 个 ({', '.join(template_vars.keys())})"
-
-    # 根据身份呈现模式选择文案
-    if config.TRANSPARENT_SUB_AGENT:
-        # 透明式：明确告知是助手在工作
-        return f"""✅ 已派遣网页开发助手 [{agent.agent_id}] 处理任务
-
-📝 任务需求: {requirement[:100]}{"..." if len(requirement) > 100 else ""}
-📊 难度评估: {diff_str} ({difficulty}/10){model_info}{vars_info}"""
-    # 沉浸式：作为自己的工作
-    return f"""✅ 我开始处理网页开发任务了
-
-📝 任务: {requirement[:100]}{"..." if len(requirement) > 100 else ""}
-📊 预计难度: {diff_str}{model_info}{vars_info}"""
-
-
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "向Agent发送消息")
-async def send_to_webapp_agent_method(
-    _ctx: AgentCtx,
-    agent_id: str,
-    message: str,
-    msg_type: str = "feedback",
-) -> str:
-    """向指定的网页开发 Agent 发送消息
-
-    用于向正在工作的子 Agent 发送指令、反馈或回答问题。
-    消息会被记录到 Agent 的通信历史中，并唤醒 Agent 继续工作。
-
-    Args:
-        agent_id: 目标 Agent ID，如 "WEB-a3f8"
-        message: 消息内容
-        msg_type: 消息类型
-            - "instruction": 新的指令或需求变更
-            - "feedback": 对现有工作的修改反馈
-            - "answer": 回答 Agent 的问题
-
-    Returns:
-        发送结果
-    """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
-    if not message or not message.strip():
-        raise ValueError("消息内容不能为空")
-
-    type_mapping = {
-        "instruction": MessageType.INSTRUCTION,
-        "feedback": MessageType.FEEDBACK,
-        "answer": MessageType.ANSWER,
-    }
-    if msg_type not in type_mapping:
-        raise ValueError(
-            f"无效的消息类型: {msg_type}，支持: instruction, feedback, answer",
+    # 启动异步执行
+    try:
+        await task.start(
+            task_type="webapp_dev",
+            task_id=task_id,
+            chat_key=_ctx.chat_key,
+            plugin=plugin,
+            on_terminal=_on_terminal,
+            requirement=requirement.strip(),
+            webapp_task_id=task_id,
         )
+        task_manager.update_status(_ctx.chat_key, task_id, "running")
+    except ValueError as e:
+        task_manager.update_status(_ctx.chat_key, task_id, "failed", error=str(e))
+        raise ValueError(f"启动失败: {e}") from e
 
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-    if not agent.is_active():
-        raise ValueError(f"Agent {agent_id} 已不在活跃状态 ({agent.status.value})")
-
-    # 如果是已确认状态，需要重新激活
-    if agent.status == AgentStatus.WAITING_CONFIRM:
-        from .services import update_agent_status
-
-        await update_agent_status(
-            agent_id.strip(),
-            _ctx.chat_key,
-            AgentStatus.WAITING_FEEDBACK,
-        )
-
-    success = await send_to_webdev_agent(
-        agent_id=agent_id.strip(),
-        chat_key=_ctx.chat_key,
-        message=message.strip(),
-        msg_type=type_mapping[msg_type],
-    )
-    if not success:
-        raise RuntimeError("发送消息失败")
-
-    await wake_up_agent(agent_id.strip(), _ctx.chat_key)
-
-    type_desc = {
-        "instruction": "新指令",
-        "feedback": "修改反馈",
-        "answer": "问题回答",
-    }.get(msg_type, "消息")
-    return f"✅ 已向 Agent [{agent_id}] 发送{type_desc}，Agent 将继续工作"
+    return task_id
 
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "确认Agent任务完成")
-async def confirm_webapp_agent(
+@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "发送WebApp反馈")
+async def send_webapp_feedback(
     _ctx: AgentCtx,
-    agent_id: str,
-    force_archive: bool = False,
+    task_id: str,
+    feedback: str,
 ) -> str:
-    """确认指定 Agent 的任务已完成
+    """向指定任务发送反馈
 
-    当对 Agent 的工作结果满意时，调用此方法确认完成。
-    确认后 Agent 仍保留在列表中，可继续接收反馈。
-    超过设定时间未访问后自动归档，或在创建新任务时自动归档。
+    可用于：
+    - 为运行中的任务追加新需求
+    - 为失败的任务提供修复指导（会重新启动任务）
 
     Args:
-        agent_id: 目标 Agent ID
-        force_archive: 是否强制归档（不保留，直接移出活跃列表）
+        task_id: 任务 ID
+        feedback: 反馈内容（新需求或修复指导）
 
     Returns:
-        确认结果
+        str: 操作确认信息
     """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
+    from .services.runtime_state import runtime_state
+    from .services.task_manager import task_manager
 
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
+    if not feedback or not feedback.strip():
+        raise ValueError("反馈内容不能为空")
 
-    if agent.status == AgentStatus.COMPLETED:
-        return f"Agent {agent_id} 已归档"
+    task_info = task_manager.get_task(_ctx.chat_key, task_id)
+    if not task_info:
+        raise ValueError(f"任务 {task_id} 不存在")
 
-    if agent.status == AgentStatus.WAITING_CONFIRM:
-        if force_archive:
-            archived = await archive_agent(agent_id.strip(), _ctx.chat_key)
-            if not archived:
-                raise RuntimeError("归档失败")
-            result = f"✅ Agent [{agent_id}] 已强制归档"
-            if archived.deployed_url:
-                result += f"\n\n页面链接: {archived.deployed_url}"
-            return result
-        return f"Agent {agent_id} 已确认完成，等待自动归档。如需立即归档，使用 force_archive=True"
+    # 追加需求
+    task_manager.append_requirement(_ctx.chat_key, task_id, feedback)
 
-    confirmed = await confirm_agent(agent_id.strip(), _ctx.chat_key)
-    if not confirmed:
-        raise RuntimeError("确认失败")
+    # 如果任务正在运行，尝试实时打断
+    if task_info.status == "running":
+        state_obj = runtime_state.get_state(_ctx.chat_key, task_id)
+        if state_obj and state_obj.inject_feedback(feedback):
+            return f"⚡ 已注入反馈到任务 {task_id}，正在打断当前操作..."
+        return "✅ 已追加 feedback，AI 将在下一轮迭代处理。"
 
-    result = f"✅ Agent [{agent_id}] 已确认完成，任务已标记为完成，仍保留在列表中"
-    if confirmed.deployed_url:
-        result += f"\n🔗 页面链接: {confirmed.deployed_url}"
-    return result
+    # 如果任务已失败或已完成，重新启动
+    if task_info.status in ("failed", "completed", "success"):
+        # 获取现有文件列表用于恢复上下文
+        project_ctx = get_project_context(_ctx.chat_key, task_id)
+        existing_files = list(project_ctx.list_files())
+
+        # 终态回调
+        def _on_terminal(ctl: TaskCtl) -> None:
+            if ctl.signal == TaskSignal.SUCCESS:
+                url = ctl.data.get("url") if isinstance(ctl.data, dict) else None
+                task_manager.update_status(_ctx.chat_key, task_id, "success", url=url)
+            else:
+                task_manager.update_status(_ctx.chat_key, task_id, "failed", error=ctl.message)
+
+        try:
+            await task.start(
+                task_type="webapp_dev",
+                task_id=task_id,
+                chat_key=_ctx.chat_key,
+                plugin=plugin,
+                on_terminal=_on_terminal,
+                requirement=task_info.get_full_requirement(),
+                webapp_task_id=task_id,
+                existing_files=existing_files,
+            )
+            task_manager.update_status(_ctx.chat_key, task_id, "running")
+        except ValueError as e:
+            raise ValueError(f"重启失败: {e}") from e
+        else:
+            return f"🔄 已重启任务 {task_id} (继承 {len(existing_files)} 个现有文件)"
+
+    return f"已追加反馈到任务 {task_id}"
 
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "取消Agent")
-async def cancel_webapp_agent_method(
+@plugin.mount_sandbox_method(SandboxMethodType.AGENT, "查看WebApp任务状态")
+async def get_webapp_task_status(
     _ctx: AgentCtx,
-    agent_id: str,
-    reason: str = "",
+    task_id: str,
 ) -> str:
-    """取消指定 Agent 的任务
+    """查看指定任务的详细状态
 
-    当不再需要某个 Agent 的工作时，调用此方法取消。
-    已部署的页面不会被删除。
-
-    Args:
-        agent_id: 目标 Agent ID
-        reason: 取消原因（可选）
-
-    Returns:
-        取消结果
-    """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
-
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-    if not agent.is_active():
-        raise ValueError(f"Agent {agent_id} 已不在活跃状态 ({agent.status.value})")
-
-    cancelled = await cancel_agent(agent_id.strip(), _ctx.chat_key, reason)
-    if not cancelled:
-        raise RuntimeError("取消失败")
-
-    result = f"✅ Agent [{agent_id}] 已取消"
-    if reason:
-        result += f"\n原因: {reason}"
-    if cancelled.deployed_url:
-        result += f"\n\n已部署的页面仍可访问: {cancelled.deployed_url}"
-    return result
-
-
-@plugin.mount_sandbox_method(SandboxMethodType.TOOL, "获取Agent预览链接")
-async def get_webapp_preview(_ctx: AgentCtx, agent_id: str) -> str:
-    """获取指定 Agent 的网页预览链接
+    返回任务进度、文件列表、错误信息等供反馈或分析。
 
     Args:
-        agent_id: 目标 Agent ID
+        task_id: 任务 ID
 
     Returns:
-        预览 URL 或状态说明
+        str: 任务详细状态信息
     """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
+    from .services.task_manager import task_manager
 
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
+    task_info = task_manager.get_task(_ctx.chat_key, task_id)
+    if not task_info:
+        return f"任务 {task_id} 不存在"
 
-    if agent.deployed_url:
-        return f"🔗 Agent [{agent_id}] 预览链接: {agent.deployed_url}"
-    return f"Agent [{agent_id}] 尚未部署页面 (当前状态: {agent.status.value})"
+    lines = [
+        f"任务 ID: {task_id}",
+        f"状态: {task_info.status}",
+        f"描述: {task_info.description}",
+    ]
 
+    if task_info.url:
+        lines.append(f"部署链接: {task_info.url}")
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "设置模板变量")
-async def set_webapp_template_var(
-    _ctx: AgentCtx,
-    agent_id: str,
-    key: str,
-    value: str,
-) -> str:
-    """设置或更新指定 Agent 的模板变量
+    if task_info.error:
+        lines.append(f"错误信息: {task_info.error}")
 
-    模板变量用于在 HTML 中传递大型内容（如 Base64 图片、长文本等）。
-    子 Agent 可在 HTML 中使用 {{key}} 占位符，部署时自动替换为实际值。
+    if len(task_info.requirements) > 1:
+        lines.append(f"需求历史 ({len(task_info.requirements)} 条):")
+        for i, req in enumerate(task_info.requirements, 1):
+            preview = req[:80] + "..." if len(req) > 80 else req
+            lines.append(f"  {i}. {preview}")
 
-    Args:
-        agent_id: 目标 Agent ID
-        key: 变量名（建议使用英文和下划线）
-        value: 变量值（可以是任意字符串，包括 Base64 编码的图片）
+    # 项目文件
+    project = get_project_context(_ctx.chat_key, task_id)
+    files = project.list_files()
+    if files:
+        lines.append(f"项目文件 ({len(files)} 个):")
+        for f in sorted(files)[:10]:
+            content = project.read_file(f)
+            size = len(content) if content else 0
+            lines.append(f"  - {f} ({size} chars)")
+        if len(files) > 10:
+            lines.append(f"  ... 还有 {len(files) - 10} 个文件")
 
-    Returns:
-        设置结果
-    """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
-    if not key or not key.strip():
-        raise ValueError("变量名不能为空")
-
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-    if not agent.is_active():
-        raise ValueError(f"Agent {agent_id} 已不在活跃状态 ({agent.status.value})")
-
-    success = await set_agent_template_var(
-        agent_id=agent_id.strip(),
-        chat_key=_ctx.chat_key,
-        key=key.strip(),
-        value=value,
-    )
-    if not success:
-        raise RuntimeError("设置失败")
-
-    preview = value[:50] + "..." if len(value) > 50 else value
-    return f"✅ 已设置 Agent [{agent_id}] 模板变量 `{key}` ({len(value)} 字符)\n预览: {preview}"
-
-
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "删除模板变量")
-async def delete_webapp_template_var(
-    _ctx: AgentCtx,
-    agent_id: str,
-    key: str,
-) -> str:
-    """删除指定 Agent 的模板变量
-
-    Args:
-        agent_id: 目标 Agent ID
-        key: 变量名
-
-    Returns:
-        删除结果
-    """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
-    if not key or not key.strip():
-        raise ValueError("变量名不能为空")
-
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-
-    success = await delete_agent_template_var(
-        agent_id=agent_id.strip(),
-        chat_key=_ctx.chat_key,
-        key=key.strip(),
-    )
-    if not success:
-        raise ValueError(f"删除失败，变量 `{key}` 可能不存在")
-
-    return f"✅ 已删除 Agent [{agent_id}] 模板变量 `{key}`"
-
-
-@plugin.mount_sandbox_method(SandboxMethodType.TOOL, "列出模板变量")
-async def list_webapp_template_vars(_ctx: AgentCtx, agent_id: str) -> str:
-    """列出指定 Agent 的所有模板变量
-
-    Args:
-        agent_id: 目标 Agent ID
-
-    Returns:
-        模板变量列表
-    """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
-
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-
-    if not agent.template_vars:
-        return f"Agent [{agent_id}] 没有模板变量"
-
-    lines = [f"📦 Agent [{agent_id}] 模板变量 ({len(agent.template_vars)} 个):\n"]
-    for key, preview in agent.get_all_template_previews(
-        config.TEMPLATE_VAR_PREVIEW_LEN,
-    ).items():
-        lines.append(f"- `{key}`: {preview}")
     return "\n".join(lines)
 
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "重试Agent")
-async def retry_webapp_agent(_ctx: AgentCtx, agent_id: str) -> str:
-    """重试失败的 Agent
-
-    当 Agent 因错误失败时，可以使用此方法重新启动。
-    会重置 Agent 状态并重新开始工作循环。
+@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "取消WebApp任务")
+async def cancel_webapp_task(
+    _ctx: AgentCtx,
+    task_id: str,
+) -> str:
+    """取消指定的 WebApp 任务
 
     Args:
-        agent_id: 失败的 Agent ID
+        task_id: 任务 ID
 
     Returns:
-        重试结果
+        str: 操作确认
     """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定 Agent ID")
+    from .services.task_manager import task_manager
 
-    agent = await get_agent(agent_id.strip(), _ctx.chat_key)
-    if not agent:
-        raise ValueError(f"Agent {agent_id} 不存在")
-    if agent.status != AgentStatus.FAILED:
-        raise ValueError(
-            f"Agent {agent_id} 不是失败状态，无法重试 (当前: {agent.status.value})",
+    task_info = task_manager.get_task(_ctx.chat_key, task_id)
+    if not task_info:
+        raise ValueError(f"任务 {task_id} 不存在")
+
+    if task_info.status not in ("pending", "running"):
+        raise ValueError(f"任务 {task_id} 状态为 {task_info.status}，无法取消")
+
+    # 尝试取消实际任务
+    if task.is_running("webapp_dev", task_id):
+        await task.cancel("webapp_dev", task_id)
+
+    task_manager.update_status(_ctx.chat_key, task_id, "failed", error="用户取消")
+    return f"已取消任务 {task_id}"
+
+
+@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "归档WebApp任务")
+async def archive_webapp_task(
+    _ctx: AgentCtx,
+    task_id: str,
+) -> str:
+    """归档已完成的任务
+
+    归档后的任务不再显示在状态列表中且不再可访问。
+
+    ⚠️ 注意：你应当遵循 “懒归档” 策略，只归档长期未访问的任务，或者在需要创建新任务时才归档不再需要的任务。永远不要在刚完成一个任务后立即归档它！
+
+    Args:
+        task_id: 任务 ID
+
+    Returns:
+        str: 操作确认
+    """
+    from .services.task_manager import task_manager
+
+    task_info = task_manager.get_task(_ctx.chat_key, task_id)
+    if not task_info:
+        raise ValueError(f"任务 {task_id} 不存在")
+
+    # 如果任务还在运行，自动取消
+    if task_info.status == "running":
+        if task.is_running("webapp_dev", task_id):
+            await task.cancel("webapp_dev", task_id)
+        task_manager.update_status(
+            _ctx.chat_key, task_id, "failed", error="用户归档时取消",
         )
 
-    # 重置并重启
-    reset_agent = await reset_failed_agent(agent_id.strip(), _ctx.chat_key)
-    if not reset_agent:
-        raise RuntimeError("重置失败")
-
-    # 启动工作循环
-    await start_agent_task(agent_id.strip(), _ctx.chat_key)
-
-    return f"✅ Agent [{agent_id}] 已重置并重新启动工作"
+    task_manager.archive_task(_ctx.chat_key, task_id)
+    return f"已归档任务 {task_id}"
 
 
-@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "分支Agent")
-async def fork_webapp_agent_method(
-    _ctx: AgentCtx,
-    agent_id: str,
-    new_requirement: str,
-    difficulty: Optional[int] = None,
-) -> str:
-    """基于现有 Agent 成果创建新 Agent
-
-    复制源 Agent 的 HTML 代码和模板变量，在此基础上开发新需求。
-    适用于需要在已有页面上继续扩展或创建变体的场景。
+@plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "清空WebApp项目")
+async def clear_webapp_project(_ctx: AgentCtx, task_id: str) -> str:
+    """清空当前任务的项目文件
 
     Args:
-        agent_id: 源 Agent ID（需要有 HTML 成果）
-        new_requirement: 新的需求描述
-        difficulty: 新任务难度（可选，默认继承源 Agent）
-
-    Returns:
-        创建结果
-
-    Examples:
-        # 在现有页面基础上添加新功能
-        fork_webapp_agent("WEB-a3f8", "在现有页面上添加一个联系表单")
-
-        # 创建页面变体
-        fork_webapp_agent("WEB-a3f8", "将现有页面改为浅色主题", 4)
+        task_id: 任务 ID
     """
-    if not agent_id or not agent_id.strip():
-        raise ValueError("请指定源 Agent ID")
-    if not new_requirement or not new_requirement.strip():
-        raise ValueError("新需求描述不能为空")
+    from .services.task_manager import task_manager
 
-    # 验证难度范围
-    if difficulty is not None:
-        difficulty = max(1, min(10, difficulty))
+    # 检查是否有任务运行
+    if task.is_running("webapp_dev", task_id):
+        raise ValueError("该任务正在运行，请先取消任务")
 
-    # 创建分支
-    new_agent, error = await fork_agent(
-        source_agent_id=agent_id.strip(),
-        chat_key=_ctx.chat_key,
-        new_requirement=new_requirement.strip(),
-        new_difficulty=difficulty,
-    )
-    if error:
-        raise RuntimeError(f"分支失败: {error}")
-    if not new_agent:
-        raise RuntimeError("创建分支失败")
+    # 验证任务是否存在 (可选，也可以允许清理未知的孤儿上下文)
+    # task_info = task_manager.get_task(_ctx.chat_key, task_id)
 
-    # 启动新 Agent
-    await start_agent_task(new_agent.agent_id, _ctx.chat_key)
+    project = get_project_context(_ctx.chat_key, task_id)
+    file_count = len(project.list_files())
 
-    difficulty_desc = {
-        range(1, 4): "🟢 简单",
-        range(4, 7): "🟡 中等",
-        range(7, 11): "🔴 困难",
-    }
-    diff_str = next(
-        (v for k, v in difficulty_desc.items() if new_agent.difficulty in k),
-        "",
-    )
+    if file_count == 0:
+        return f"任务 {task_id} 的项目已为空"
 
-    return f"""✅ 从 [{agent_id}] 分支创建新 Agent [{new_agent.agent_id}]
-
-📝 新需求: {new_requirement[:100]}{"..." if len(new_requirement) > 100 else ""}
-📊 难度: {diff_str} ({new_agent.difficulty}/10)
-📦 继承了源 Agent 的 HTML 代码和 {len(new_agent.template_vars)} 个模板变量"""
+    clear_project_context(_ctx.chat_key, task_id)
+    return f"已清空 {file_count} 个文件 (任务: {task_id})"
 
 
 # ==================== 提示词注入 ====================
@@ -545,62 +579,89 @@ async def fork_webapp_agent_method(
 
 @plugin.mount_prompt_inject_method("webapp_status")
 async def webapp_status_inject(_ctx: AgentCtx) -> str:
-    """注入 WebApp Agent 系统状态到主 Agent 提示词"""
-    return await inject_webapp_status(_ctx)
+    """注入任务状态视图，供主 Agent 按 task_id 协调操作"""
+    from .services.task_manager import task_manager
 
-
-# ==================== 启动和清理 ====================
-
-
-async def _resume_incomplete_agents() -> None:
-    """恢复未完成的任务（内部函数）"""
     try:
-        chat_keys = await get_all_chat_keys_with_agents()
-        resumed_count = 0
+        tasks = task_manager.list_active_tasks(_ctx.chat_key)
 
-        for chat_key in chat_keys:
-            agents = await get_resumable_agents(chat_key)
-            for agent in agents:
-                try:
-                    await start_agent_task(agent.agent_id, chat_key)
-                    resumed_count += 1
-                    logger.info(f"恢复 Agent 任务: {agent.agent_id}")
-                except Exception as e:
-                    logger.warning(f"恢复 Agent {agent.agent_id} 失败: {e}")
+        # 统计活跃任务数（pending + running）
+        active_count = sum(1 for t in tasks if t.status in ("pending", "running"))
+        max_tasks = config.MAX_CONCURRENT_TASKS
 
-        if resumed_count > 0:
-            logger.info(f"WebApp 插件启动完成，恢复了 {resumed_count} 个未完成的任务")
-        else:
-            logger.debug("WebApp 插件启动完成，无需恢复的任务")
+        if not tasks:
+            # 无任务时仍显示槽位信息
+            return f"[WebApp] 任务槽位: {active_count}/{max_tasks}"
+
+        lines = [f"[WebApp 任务] 槽位: {active_count}/{max_tasks}"]
+        for t in tasks[:5]:
+            icon = {
+                "running": "🔄",
+                "pending": "⏳",
+                "success": "✅",
+                "failed": "❌",
+            }.get(t.status, "?")
+
+            # 突出显示 task_id
+            desc = (
+                t.description[:35] + "..." if len(t.description) > 35 else t.description
+            )
+            lines.append(f"{icon} task_id={t.task_id} | {desc}")
+
+            if t.url:
+                lines.append(f"   └─ {t.url}")
+            if t.error:
+                err = t.error[:40] + "..." if len(t.error) > 40 else t.error
+                lines.append(f"   └─ 错误: {err}")
+
+        # 操作提示
+        has_failed = any(t.status == "failed" for t in tasks)
+        has_success = any(t.status == "success" for t in tasks)
+
+        if has_failed:
+            lines.append("可用 发送WebApp反馈(task_id, feedback) 重启失败任务")
+
+        # 提醒不要过早归档
+        if has_success:
+            lines.append("注意: 不要完成任务后立即归档它，保留供用户可能的后续修改")
+
+        return "\n".join(lines)
+
+    except Exception:
+        return ""
+
+
+# ==================== 生命周期 ====================
+
+
+@plugin.on_enabled()
+async def _startup() -> None:
+    """插件启动"""
+    try:
+        from .services import node_manager
+        from .services.task_tracer import TaskTracer
+
+        # 使用 Dummy Tracer 检查环境，避免生成日志文件
+        tracer = TaskTracer(
+            chat_key="system",
+            root_agent_id="startup",
+            task_description="environment check",
+            plugin_data_dir=str(plugin.get_plugin_data_dir()),
+            enabled=False,
+        )
+
+        node_path = await node_manager.get_node_executable(tracer, agent_id="startup")
+        logger.info(f"WebApp 插件已启用 (Node.js: {node_path})")
     except Exception as e:
-        logger.warning(f"WebApp 插件启动时恢复任务失败: {e}")
+        logger.error(f"WebApp 插件启动警告: 本地编译环境自检失败 - {e}")
+        logger.error("请确保系统安装了 Node.js (>=16)")
 
 
-@plugin.mount_cleanup_method()
-async def clean_up() -> None:
-    """清理插件资源，停止所有运行中的任务"""
-    try:
-        stopped_count = await stop_all_tasks()
-        if stopped_count > 0:
-            logger.info(f"WebApp 插件已清理 {stopped_count} 个运行中的任务")
-        else:
-            logger.info("WebApp 插件资源已清理")
-    except Exception as e:
-        logger.warning(f"WebApp 插件清理失败: {e}")
-
-
-# 插件加载时调度恢复任务
-def _schedule_resume_on_load() -> None:
-    """在插件加载时调度恢复任务"""
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_resume_incomplete_agents())
-    except RuntimeError:
-        # 没有运行中的事件循环，跳过
-        pass
-
-
-_schedule_resume_on_load()
-
+@plugin.on_disabled()
+async def _cleanup() -> None:
+    """插件停用"""
+    # 停止所有任务
+    count = await task.stop_all()
+    if count > 0:
+        logger.info(f"WebApp 插件停用，已停止 {count} 个任务")
+    logger.info("WebApp 插件已停用")
