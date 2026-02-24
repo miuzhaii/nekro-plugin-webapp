@@ -13,6 +13,7 @@ from nekro_agent.services.plugin.base import SandboxMethodType
 from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl, TaskSignal, task
 
 from . import commands as _commands  # noqa: F401
+from . import handlers as _handlers  # noqa: F401
 from .plugin import config, plugin
 from .services.task_tracer import TaskTracer
 from .services.vfs import clear_project_context, get_project_context
